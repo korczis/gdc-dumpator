@@ -7,6 +7,8 @@ PASSWORD = ENV['GDC_PASSWORD'] || ''
 SERVER = ENV['GDC_SERVER'] || 'https://instance-develop-45.dev.intgdc.com'
 PID = ENV['GDC_PID'] || 'l739tknzsa2b6mp9m49e1s6m1s8jdmhi'
 
+MD_REGEX = %r{/gdc/md/\w+/obj/\d+}
+
 def fetch(client, link)
   puts "Fetching #{link}"
 
@@ -33,7 +35,7 @@ def main
   data = links.map do |link|
     begin
       category = link['category']
-      items = fetch(client, link['link'].gsub('limit=5', 'limit=50') + '&include=predecessors')
+      items = fetch(client, link['link'].gsub('limit=5', 'limit=50') + '&include=predecessors&deprecated=1')
 
       category_dir = File.join(data_dir, category)
       FileUtils.mkdir_p(category_dir)
@@ -45,6 +47,15 @@ def main
         puts "Writing #{item_path}"
         File.open(item_path, 'w') do |f|
           f.write(JSON.pretty_generate(item))
+        end
+      end
+
+      if category == 'attribute'
+        items.each do |item|
+          item['attribute']['content']['displayForms'].each do |df|
+            df.delete('links')
+            df.delete('meta')
+          end
         end
       end
 
@@ -60,19 +71,43 @@ def main
 
   objects = data.map(&:last)
   objects.flatten!
-  # pp objects
 
   lookup = {}
   objects.each do |obj|
     root = obj.keys.first
-    obj_uri = obj[root]['meta']['uri']
+    raw = obj[root]
+    obj_uri = raw['meta']['uri']
     lookup[obj_uri] = obj
+  end
+
+  objs_to_check = objects
+  while obj = objs_to_check.shift
+    root = obj.keys.first
+    raw = obj[root]
+
+    JSON.pretty_generate(raw).scan(MD_REGEX).each do |uri|
+      next if lookup[uri]
+
+      puts "Second pass fetch '#{uri}'"
+      obj = client.get(uri)
+
+      root = obj.keys.first
+      raw = obj[root]
+      lookup[uri] = obj
+      objs_to_check.push(obj)
+    end
+  end
+
+  lookup.each do |_uri, obj|
+    root = obj.keys.first
+    raw = obj[root]
+
   end
 
   sorted = []
   processed = Set.new
   uris = lookup.keys
-  while uri = uris.shift do
+  while uri = uris.shift
     toposort(processed, sorted, uri, lookup)
   end
 
@@ -85,14 +120,14 @@ def main
 
     puts "#{key}: #{raw['meta']['identifier']} - #{raw['meta']['uri']}"
   end
+
+  generate_metadata_json(sorted, lookup)
 end
 
 def toposort(processed, sorted, uri, lookup)
   obj = lookup[uri]
 
-  if processed.include?(uri)
-    return
-  end
+  return if processed.include?(uri)
 
   if obj.nil?
     puts "Unable to find object #{uri}"
@@ -102,7 +137,7 @@ def toposort(processed, sorted, uri, lookup)
   root = obj.keys.first
   raw = obj[root]
 
-  predecessors = raw['links']['predecessors'] || []
+  predecessors = (raw['links'] && raw['links']['predecessors']) || []
   predecessors.each do |predecessor|
     toposort(processed, sorted, predecessor, lookup)
   end
@@ -110,6 +145,60 @@ def toposort(processed, sorted, uri, lookup)
   processed.add(uri)
 
   sorted.push(uri)
+end
+
+def get_raw_object(object)
+  root = object.keys.first
+  object[root]
+end
+
+def generate_name(object)
+  root = object.keys.first
+  raw = object[root]
+  id = raw['meta']['identifier']
+  "#{root}.#{id}"
+end
+
+def generate_metadata_json(sorted, lookup)
+  path = File.join(File.dirname(__FILE__), 'metadata.json')
+
+  objects = sorted.map do |uri|
+    lookup[uri]
+  end
+
+  data = {
+    objects: objects.map do |object|
+      root = object.keys.first
+      raw = object[root]
+      id = raw['meta']['identifier']
+      name = "#{root}.#{id}"
+      content = JSON.pretty_generate(object)
+
+      content.scan(MD_REGEX).each do |uri|
+        target = lookup[uri]
+        if target
+          content.gsub!(uri, "{{#{generate_name(target)}}}")
+        else
+          puts "Unable to replace url '#{uri}', object not found"
+          puts JSON.pretty_generate(object)
+        end
+      end
+
+      {
+          name: name,
+          content: JSON.parse(content)
+      }
+    end
+  }
+
+  File.open('objects.json', 'w') do |f|
+    f.write(JSON.pretty_generate(objects))
+  end
+
+  File.open('metadata.json', 'w') do |f|
+    f.write(JSON.pretty_generate(data))
+  end
+
 end
 
 main if __FILE__ == $PROGRAM_NAME
